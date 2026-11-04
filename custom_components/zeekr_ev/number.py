@@ -18,8 +18,10 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import restore_state
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, VTM_MAX_DURATION, VTM_MIN_DURATION
+from . import command_result  # local patch, stormshaker/home-assistant-config#1289
 from .coordinator import ZeekrCoordinator
 from .entity import (
     setup_refrigeration_box_discovery,
@@ -206,6 +208,26 @@ class ZeekrChargingLimitNumber(ZeekrEntity, RestoreNumber):
         self._attr_name = "Charging Limit"
         self._attr_unique_id = f"{vin}_charging_limit"
         self._attr_native_value: float | None = None
+        # Local patch (#1289): the last command's outcome, from the car rather than the gateway.
+        self._last_command: dict | None = None
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        """The last limit command and what came back for it (#1289)."""
+        if not self._last_command:
+            return None
+        c = self._last_command
+        return {
+            "last_command_value": c.get("value"),
+            "last_command_at": c.get("at"),
+            "last_command_accepted": c.get("accepted"),
+            "last_command_session_id": c.get("session_id"),
+            "last_command_result": c.get("result"),
+            "last_command_result_code": c.get("result_code"),
+            "last_command_result_msg": c.get("result_msg"),
+            "last_command_heartbeat_code": c.get("heartbeat_code"),
+            "last_command_done": c.get("done", False),
+        }
 
     @property
     def native_value(self) -> float | None:
@@ -260,9 +282,32 @@ class ZeekrChargingLimitNumber(ZeekrEntity, RestoreNumber):
         }
 
         await self.coordinator.async_inc_invoke()
-        await self.hass.async_add_executor_job(
-            vehicle.do_remote_control, command, service_id, setting
+        # Local patch (#1289): heartbeat first, keep the sessionId, then poll for the car's
+        # answer in the background and fire it as an event. Was:
+        #   vehicle.do_remote_control(command, service_id, setting)
+        client = vehicle._client
+        outcome = await self.hass.async_add_executor_job(
+            command_result.send_with_heartbeat, client, self.vin, command, setting
         )
+        outcome["value"] = value
+        outcome["at"] = dt_util.utcnow().isoformat()
+        self._last_command = outcome
+
+        async def _poll() -> None:
+            final = await self.hass.async_add_executor_job(
+                command_result.poll_outcome, client, self.vin, dict(outcome)
+            )
+            final["done"] = True
+            # Only report on the latest command; a newer one replaces this.
+            if self._last_command is not None and self._last_command.get("session_id") == final.get("session_id"):
+                self._last_command = final
+                self.async_write_ha_state()
+            self.hass.bus.async_fire(
+                command_result.EVENT_COMMAND_RESULT,
+                {"vin": self.vin, "entity_id": self.entity_id, "command": "charging_limit", **final},
+            )
+
+        self.hass.async_create_task(_poll())
 
         # Reflect the new target immediately (native_value prefers the
         # coordinator value, which would otherwise snap back to the old SoC),
