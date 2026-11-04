@@ -222,9 +222,9 @@ class ZeekrChargingLimitNumber(ZeekrEntity, RestoreNumber):
             "last_command_at": c.get("at"),
             "last_command_accepted": c.get("accepted"),
             "last_command_session_id": c.get("session_id"),
-            "last_command_result": c.get("result"),
-            "last_command_result_code": c.get("result_code"),
-            "last_command_result_msg": c.get("result_msg"),
+            "last_command_confirmed": c.get("confirmed"),
+            "last_command_reported_value": c.get("reported_value"),
+            "last_command_reported_at": c.get("reported_at"),
             "last_command_heartbeat_code": c.get("heartbeat_code"),
             "last_command_heartbeat_variant": c.get("heartbeat_variant"),
             "last_command_done": c.get("done", False),
@@ -296,7 +296,7 @@ class ZeekrChargingLimitNumber(ZeekrEntity, RestoreNumber):
 
         async def _poll() -> None:
             final = await self.hass.async_add_executor_job(
-                command_result.poll_outcome, client, self.vin, dict(outcome)
+                command_result.confirm_charging_limit, client, self.vin, dict(outcome), value
             )
             final["done"] = True
             # Only report on the latest command; a newer one replaces this.

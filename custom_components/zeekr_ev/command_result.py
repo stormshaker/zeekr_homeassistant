@@ -8,10 +8,10 @@ built from Frida captures of the app):
 1. It marks itself as the account's online device with POST
    ms-app-online-manager/api/v1.0/app/hb right before each command. openzeekr found the
    car only executes cloud commands for the online device.
-2. It keeps the sessionId the command returns, and polls
-   ms-remote-control/api/v1.0/remoteControl/queryProcessResult for the outcome. The
-   library's do_remote_control returns only the gateway's `success`, which means
-   "queued", not "done".
+2. It confirms a limit change by re-reading getLatestSoc about 15 s later. It never
+   calls queryProcessResult, which answers 079001 to this client. The library's
+   do_remote_control returns only the gateway's `success`, which means "queued", not
+   "done".
 
 The outcome is fired as the `zeekr_ev_command_result` event and returned, so
 automations can wait for it and the entity can show it.
@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from zeekr_ev_api import const as api_const
@@ -32,10 +33,6 @@ _LOGGER = logging.getLogger(__name__)
 EVENT_COMMAND_RESULT = "zeekr_ev_command_result"
 
 HEARTBEAT_PATH = "ms-app-online-manager/api/v1.0/app/hb"
-RESULT_PATHS = (
-    "ms-remote-control/api/v1.0/remoteControl/queryProcessResult",
-    "ms-remote-control/v1.0/remoteControl/queryProcessResult",
-)
 
 
 def _base(client) -> str:
@@ -107,52 +104,10 @@ def send_charge_control(client, vin: str, command: str, setting: dict) -> dict[s
     return resp
 
 
-def query_result(client, vin: str, session_id: str) -> dict[str, Any] | None:
-    """One poll of the command's outcome. Tries the documented path, then the v1.0 form."""
-    for extra in ({}, {"X-PROJECT-ID": "ZEEKR"}):
-        resp = _query_result_once(client, vin, session_id, extra)
-        if resp is not None and resp.get("code") != "079001":
-            return resp
-    return resp
-
-
-def _query_result_once(client, vin: str, session_id: str, extra: dict) -> dict[str, Any] | None:
-    headers = {"X-VIN": client._get_encrypted_vin(vin), **extra}
-    for path in RESULT_PATHS:
-        try:
-            resp = network.appSignedGet(
-                client, f"{_base(client)}{path}?sessionId={session_id}", headers=headers
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Zeekr queryProcessResult %s failed: %s", path, err)
-            continue
-        _LOGGER.info(
-            "Zeekr queryProcessResult (%s %s): code=%s msg=%s data=%s",
-            path,
-            extra or "",
-            resp.get("code"),
-            resp.get("msg"),
-            resp.get("data"),
-        )
-        if resp.get("code") not in ("00A01", "000010"):  # not "no such route"
-            return resp
-    return None
-
-
-def _finished(resp: dict[str, Any] | None) -> bool:
-    """True once the result looks final. The shape is not documented, so be generous."""
-    if not resp:
-        return False
-    data = resp.get("data")
-    if not resp.get("success") or not data:
-        return True  # an error answer is final
-    text = json.dumps(data).lower()
-    return not any(w in text for w in ('"pending"', '"processing"', '"running"', '"sending"'))
-
-
 def send_with_heartbeat(client, vin: str, command: str, setting: dict) -> dict[str, Any]:
     """Heartbeat, then send. Quick; runs in an executor thread inside the service call."""
     hb = heartbeat(client, vin)
+    sent_ts = time.time()
     sent = send_charge_control(client, vin, command, setting)
     return {
         "heartbeat_code": hb.get("code"),
@@ -161,27 +116,57 @@ def send_with_heartbeat(client, vin: str, command: str, setting: dict) -> dict[s
         "send_code": sent.get("code"),
         "send_msg": sent.get("msg"),
         "session_id": (sent.get("data") or {}).get("sessionId"),
-        "result": None,
-        "result_code": None,
-        "result_msg": None,
-        "polls": 0,
+        "sent_ts": sent_ts,
+        "confirmed": None,
+        "reported_value": None,
+        "reported_at": None,
+        "checks": 0,
     }
 
 
-def poll_outcome(client, vin: str, outcome: dict[str, Any], polls: int = 6, gap: float = 5.0) -> dict[str, Any]:
-    """Poll for the car's answer. Slow; runs in an executor thread after the call returns."""
-    session_id = outcome.get("session_id")
-    if not session_id:
+def _soc_time(text: str | None) -> float | None:
+    """getLatestSoc's socTime is UTC, as "YYYY-MM-DD HH:MM:SS"."""
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def confirm_charging_limit(
+    client, vin: str, outcome: dict[str, Any], value: float, delays: tuple[float, ...] = (15.0, 15.0)
+) -> dict[str, Any]:
+    """Confirm a limit change the way the official app does: re-read getLatestSoc.
+
+    The app never asks queryProcessResult (it answers 079001 to this client anyway). It
+    re-reads the limit about 15 s after the command. Confirmed means the reported limit
+    matches the command AND its socTime is from after the send, so an old value that
+    happens to match cannot pass for a new one. At most len(delays) reads.
+    """
+    if not outcome.get("accepted"):
+        outcome["confirmed"] = False
         return outcome
-    for i in range(polls):
-        time.sleep(gap)
-        resp = query_result(client, vin, session_id)
-        outcome["polls"] = i + 1
-        if resp is None:
-            break
-        outcome["result"] = resp.get("data")
-        outcome["result_code"] = resp.get("code")
-        outcome["result_msg"] = resp.get("msg")
-        if _finished(resp):
-            break
+    want = int(round(value * 10))
+    for delay in delays:
+        time.sleep(delay)
+        outcome["checks"] += 1
+        try:
+            data = client.get_vehicle_charging_limit(vin) or {}
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Zeekr getLatestSoc confirm read failed: %s", err)
+            continue
+        soc, soc_text = data.get("soc"), data.get("socTime")
+        at = _soc_time(soc_text)
+        outcome["reported_value"] = int(soc) / 10 if str(soc).isdigit() else soc
+        outcome["reported_at"] = soc_text
+        fresh = at is not None and at >= outcome["sent_ts"] - 5
+        _LOGGER.info(
+            "Zeekr limit confirm %d: want %s, getLatestSoc %s at %s (%s)",
+            outcome["checks"], want, soc, soc_text, "fresh" if fresh else "stale",
+        )
+        if str(soc) == str(want) and fresh:
+            outcome["confirmed"] = True
+            return outcome
+    outcome["confirmed"] = False
     return outcome
