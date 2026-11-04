@@ -42,22 +42,49 @@ def _base(client) -> str:
     return (client.region_login_server or "").rstrip("/") + "/"
 
 
-def heartbeat(client) -> dict[str, Any]:
+# Header and body variants tried in order until one answers 000000. From a capture of the
+# official iOS app (SEA, v1.6.8, 4 Nov 2026): it sends X-VIN on app/hb, X-PROJECT-ID "ZEEKR"
+# (the library sends "ZEEKR_SEA"), and hbType 4. Once a variant works it is remembered.
+HB_VARIANTS = (
+    ("vin", {}, 3),
+    ("vin+project", {"X-PROJECT-ID": "ZEEKR"}, 3),
+    ("vin+project+hbType4", {"X-PROJECT-ID": "ZEEKR"}, 4),
+)
+_hb_working: int | None = None
+
+
+def heartbeat(client, vin: str | None = None) -> dict[str, Any]:
     """Mark this client as the account's online device. Best effort."""
-    body = {
-        "deviceId": client.logged_in_headers.get("x-device-id", ""),
-        "deviceType": 1,
-        "hbType": 3,
-        "ts": int(time.time() * 1000),
-    }
-    try:
-        resp = network.appSignedPost(
-            client, _base(client) + HEARTBEAT_PATH, json.dumps(body, separators=(",", ":"))
-        )
-    except Exception as err:  # noqa: BLE001 - best effort, never block the command
-        _LOGGER.warning("Zeekr app/hb failed: %s", err)
-        return {"success": False, "error": str(err)}
-    _LOGGER.info("Zeekr app/hb: code=%s msg=%s", resp.get("code"), resp.get("msg"))
+    global _hb_working
+    order = [_hb_working] if _hb_working is not None else range(len(HB_VARIANTS))
+    resp: dict[str, Any] = {}
+    for i in order:
+        name, extra, hb_type = HB_VARIANTS[i]
+        body = {
+            "deviceId": client.logged_in_headers.get("x-device-id", ""),
+            "deviceType": 1,
+            "hbType": hb_type,
+            "ts": int(time.time() * 1000),
+        }
+        headers = dict(extra)
+        if vin:
+            headers["X-VIN"] = client._get_encrypted_vin(vin)
+        try:
+            resp = network.appSignedPost(
+                client,
+                _base(client) + HEARTBEAT_PATH,
+                json.dumps(body, separators=(",", ":")),
+                extra_headers=headers,
+            )
+        except Exception as err:  # noqa: BLE001 - best effort, never block the command
+            _LOGGER.warning("Zeekr app/hb (%s) failed: %s", name, err)
+            continue
+        _LOGGER.info("Zeekr app/hb (%s): code=%s msg=%s data=%s", name, resp.get("code"), resp.get("msg"), resp.get("data"))
+        if resp.get("code") == "000000":
+            _hb_working = i
+            resp["variant"] = name
+            return resp
+    _hb_working = None
     return resp
 
 
@@ -82,7 +109,15 @@ def send_charge_control(client, vin: str, command: str, setting: dict) -> dict[s
 
 def query_result(client, vin: str, session_id: str) -> dict[str, Any] | None:
     """One poll of the command's outcome. Tries the documented path, then the v1.0 form."""
-    headers = {"X-VIN": client._get_encrypted_vin(vin)}
+    for extra in ({}, {"X-PROJECT-ID": "ZEEKR"}):
+        resp = _query_result_once(client, vin, session_id, extra)
+        if resp is not None and resp.get("code") != "079001":
+            return resp
+    return resp
+
+
+def _query_result_once(client, vin: str, session_id: str, extra: dict) -> dict[str, Any] | None:
+    headers = {"X-VIN": client._get_encrypted_vin(vin), **extra}
     for path in RESULT_PATHS:
         try:
             resp = network.appSignedGet(
@@ -92,8 +127,9 @@ def query_result(client, vin: str, session_id: str) -> dict[str, Any] | None:
             _LOGGER.warning("Zeekr queryProcessResult %s failed: %s", path, err)
             continue
         _LOGGER.info(
-            "Zeekr queryProcessResult (%s): code=%s msg=%s data=%s",
+            "Zeekr queryProcessResult (%s %s): code=%s msg=%s data=%s",
             path,
+            extra or "",
             resp.get("code"),
             resp.get("msg"),
             resp.get("data"),
@@ -116,10 +152,11 @@ def _finished(resp: dict[str, Any] | None) -> bool:
 
 def send_with_heartbeat(client, vin: str, command: str, setting: dict) -> dict[str, Any]:
     """Heartbeat, then send. Quick; runs in an executor thread inside the service call."""
-    hb = heartbeat(client)
+    hb = heartbeat(client, vin)
     sent = send_charge_control(client, vin, command, setting)
     return {
         "heartbeat_code": hb.get("code"),
+        "heartbeat_variant": hb.get("variant"),
         "accepted": bool(sent.get("success")),
         "send_code": sent.get("code"),
         "send_msg": sent.get("msg"),

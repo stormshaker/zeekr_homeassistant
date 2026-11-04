@@ -226,6 +226,7 @@ class ZeekrChargingLimitNumber(ZeekrEntity, RestoreNumber):
             "last_command_result_code": c.get("result_code"),
             "last_command_result_msg": c.get("result_msg"),
             "last_command_heartbeat_code": c.get("heartbeat_code"),
+            "last_command_heartbeat_variant": c.get("heartbeat_variant"),
             "last_command_done": c.get("done", False),
         }
 
